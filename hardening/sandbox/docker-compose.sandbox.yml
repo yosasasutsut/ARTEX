@@ -78,7 +78,15 @@ services:
         ( cd /src && tar cf - --exclude=./web --exclude=./scripts/poc --exclude=./.git . ) | ( cd /work/src && tar xf - )
         cd /work/src
         if [ "$$APPLY_PATCHES" = "1" ]; then
-          for p in hardening/patches/*.patch; do echo "== apply $$p =="; git apply "$$p"; done
+          for p in hardening/patches/*.patch; do
+            echo "== apply $$p =="
+            # A Windows checkout has CRLF endings; the patches are LF. Normalize
+            # the files a patch touches before applying it.
+            for f in $$(git apply --numstat "$$p" | awk '{print $$3}'); do
+              if [ -f "$$f" ]; then sed -i 's/\r$$//' "$$f"; fi
+            done
+            git apply "$$p"
+          done
         fi
         echo "== go build =="; go build ./...
         echo "== go vet ==";   go vet ./...
