@@ -74,6 +74,14 @@ Without `build.sh` (a plain upstream image) the overlay still works: the network
 firewall, DNS filter and named volumes apply; only the in-program allowlist and
 the tighter build pins are missing.
 
+**On Windows, always build with `build.sh`, not `docker compose build`.** A
+Windows checkout has CRLF line endings, and `docker compose build` embeds the SQL
+migration files that way. Their checksums then differ from an image built with LF
+endings (`build.sh`, and every upstream release), and a database created by one
+kind of image refuses to start with the other: `migration 0001 ...: checksum
+changed since it was applied`. Stay with one kind; `build.sh` gives the same
+bytes as upstream.
+
 ## Test
 
 ```
