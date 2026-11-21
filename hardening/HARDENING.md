@@ -1,9 +1,17 @@
 # ARTEX hardening and trust notes
 
-This document records a security review of this checkout and the operator-side
-hardening added on top of it. It is maintained in this fork; it is not upstream.
+This document records a security review of ARTEX and the operator-side hardening
+this fork adds. It is maintained in this fork; it is not upstream.
 
-Reviewed at commit `22ae88a` (v0.7.0).
+Reviewed at upstream commit `22ae88a` (v0.7.0). Upstream commits after it were
+only scanned for new network calls, command execution and dependency changes.
+
+**Layout.** Everything this fork adds lives in the `hardening/` folder, and no
+upstream file is changed on this branch. The two things that need edits to
+upstream code (wiring the allowlist into the clients, and the Dockerfile pins)
+are kept as patch files in `hardening/patches/`; `hardening/build.sh` applies
+them to a temporary copy of the tree and builds the image from that copy. See
+[README.md](README.md).
 
 ## 1. Code-trust review (static)
 
@@ -82,7 +90,9 @@ PKG=./hardening/... hardening/sandbox/run.sh  # scope to one package
 ### Control-plane egress allowlist
 
 `hardening/allowlist/allowlist.go` restricts the fixed, operator-owned clients to an approved
-host set. Off by default. See `hardening/env.example`:
+host set. It is wired into those clients by `patches/0001-egress-allowlist.patch`,
+so it is present only in an image built with `hardening/build.sh`. Off by
+default. See `hardening/env.example`:
 
 ```
 ARTEX_EGRESS_MODE=audit|enforce
@@ -185,18 +195,24 @@ Limits: an allowed host name admits other sites on the same IP address. A listed
 target is reachable by the agent on any port, so data can leave towards a target
 you listed. If `egress-fw` is recreated, restart `artex` as well.
 
-## 4. Build from source (don't trust prebuilt binaries)
+## 4. Build from source
 
 ```
-# Reproducible-ish single binary, no cgo:
-cd web && npm ci --ignore-scripts && npm run build:static && cd ..
-rm -rf server/webui/dist && cp -r web/out server/webui/dist
-CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+hardening/build.sh
 ```
 
-Or build the Docker image from this checkout (`docker compose build`). Pin to a
-reviewed commit; re-review `go.mod` (the `replace` line) and the `BaaRai/Norma`
-tag on every upgrade.
+This exports the committed tree to a temporary directory, applies
+`hardening/patches/*.patch` there and runs `docker build` on that copy, so the
+checkout stays identical to what is committed. It needs git and docker; no Go or
+Node toolchain on the host.
+
+Build from a commit you have reviewed. On every upstream update, re-read `go.mod`
+(the `replace` line), the `BaaRai/Norma` tag and the Dockerfile, and refresh a
+patch that no longer applies.
+
+The published v0.7.0 binaries were checked and reproduced (section 6), so they
+are a reasonable alternative to building; they do not contain this fork's
+allowlist.
 
 ## 5. Bundled tools: provenance check
 
@@ -217,7 +233,8 @@ copies:
 | npm packages (web UI) | `registry.npmjs.org` only | every non-bundled entry in `package-lock.json` carries an integrity hash |
 | Go modules | module proxy | verified against `sum.golang.org`; no `GONOSUMDB`/`GOPRIVATE` override |
 
-Pins tightened in this fork:
+Pins tightened in this fork (applied by `patches/0002-dockerfile-pins.patch`,
+so they hold for an image built with `hardening/build.sh`):
 
 - **Base images** (`node`, `golang`, `debian`, `python`, `postgres`, `alpine`)
   are pinned by digest.
@@ -235,9 +252,14 @@ known-good state and keep the built image rather than rebuilding on every deploy
 
 ## 6. Verification record
 
-Run on 2026-11-21 against this branch. Everything below ran inside containers:
-the host Go and Node toolchains were not used. No port was published to the
-host during testing. Runs that needed internet say so.
+Run on 2026-11-21. Everything below ran inside containers: the host Go and Node
+toolchains were not used. No port was published to the host during testing. Runs
+that needed internet say so.
+
+Most of these runs were made on upstream commit `22ae88a` with this fork's changes
+applied directly to the upstream files. The work was then moved into
+`hardening/` and rebased onto upstream `2411943`; the subsection "After the move
+into hardening/" at the end lists what was run again on that final layout.
 
 ### Go code
 
@@ -381,6 +403,27 @@ itself kept working throughout: it reached the model and the database.
 - With the named volumes of the overlay, `/app/keys` is `0700` root; as uid 10001
   reading `jwt.key`, creating a file in the key directory and creating a file in
   `/app/skills` are all denied.
+
+### After the move into hardening/
+
+On the final layout (upstream `2411943` plus `hardening/`):
+
+- Outside `hardening/` the branch has no difference from upstream (0 paths).
+- Both patches apply cleanly. The patched tree is identical, file for file, to
+  the tree the earlier runs tested (compared in a container with LF checkouts).
+- `gofmt` reports no difference on the patched tree.
+- The full Go suite passes on the patched tree (20 packages `ok`, 0 failures) and
+  on the unpatched tree (`APPLY_PATCHES=0`, same counts).
+- `hardening/build.sh` built the image; it starts and logs the allowlist.
+- The agent run with the hijacked model was repeated on that image with the
+  overlay: every row of the table above came out the same. The web-search test
+  was again refused by the allowlist.
+- The 15 upstream commits between `22ae88a` and `2411943` change no dependency,
+  Dockerfile, workflow or install script, and add no new host, network call or
+  command execution outside tests. That was a scan, not a review.
+
+Not repeated on the final layout: the race-detector run, the web UI tests, the
+release-binary checks and the hand probes of the first firewall revision.
 
 ### Not verified
 
