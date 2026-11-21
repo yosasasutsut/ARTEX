@@ -1,0 +1,509 @@
+diff --git a/agent/provider.go b/agent/provider.go
+index 96d39a6..510977b 100644
+--- a/agent/provider.go
++++ b/agent/provider.go
+@@ -22,6 +22,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/Autumn-27/artex/hardening/allowlist"
+ 	"github.com/Autumn-27/artex/llmrec"
+ 	"github.com/Autumn-27/norma/agentcore"
+ 	"github.com/Autumn-27/norma/compaction"
+@@ -553,7 +554,12 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Clie
+ 		}
+ 		transport.Proxy = http.ProxyURL(proxyURL)
+ 	}
+-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey), userAgent: strings.TrimSpace(userAgent)}}, nil
++	// allowlist.Guard wraps the transport with the operator's control-plane host
++	// allowlist. It is the outermost layer, so a request to an unapproved host is
++	// refused before it leaves — even a proxied one. Off by default (no env set),
++	// Guard returns the inner transport unchanged, so behavior is identical.
++	inner := quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey), userAgent: strings.TrimSpace(userAgent)}
++	return &http.Client{Transport: allowlist.Guard(inner)}, nil
+ }
+ 
+ // MaxUserAgentLen bounds a custom User-Agent value. Generous for real UA strings
+diff --git a/archivestore/egress_allowlist_test.go b/archivestore/egress_allowlist_test.go
+new file mode 100644
+index 0000000..706ed22
+--- /dev/null
++++ b/archivestore/egress_allowlist_test.go
+@@ -0,0 +1,50 @@
++package archivestore
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/Autumn-27/artex/hardening/allowlist"
++)
++
++// An archive endpoint that is not on the control-plane allowlist must not
++// receive the upload.
++func TestAllowlistGuardsArchiveUpload(t *testing.T) {
++	var hits atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		hits.Add(1)
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer srv.Close()
++
++	store, err := New(Config{Endpoint: srv.URL, Region: "us-east-1", Bucket: "test-bucket", Prefix: "test/tasks", AccessKey: "test", SecretKey: "test", PathStyle: true})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	data := []byte("archive payload")
++	sum := sha256.Sum256(data)
++	checksum := hex.EncodeToString(sum[:])
++	source := filepath.Join(t.TempDir(), "a.tar.zst")
++	if err := os.WriteFile(source, data, 0o600); err != nil {
++		t.Fatal(err)
++	}
++
++	prev := allowlist.SetActiveAllowlist(allowlist.ParseAllowlist("enforce", "s3.example.com"))
++	defer allowlist.SetActiveAllowlist(prev)
++
++	err = store.Upload(context.Background(), store.URI(1, 2, checksum), source, checksum)
++	if err == nil || !strings.Contains(err.Error(), "not in the allowlist") {
++		t.Fatalf("upload to an unlisted endpoint: err=%v, want an allowlist refusal", err)
++	}
++	if hits.Load() != 0 {
++		t.Fatalf("the archive endpoint was contacted %d time(s) despite the allowlist", hits.Load())
++	}
++}
+diff --git a/archivestore/s3.go b/archivestore/s3.go
+index 5761a83..02bb51a 100644
+--- a/archivestore/s3.go
++++ b/archivestore/s3.go
+@@ -16,6 +16,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/Autumn-27/artex/hardening/allowlist"
+ 	"github.com/aws/aws-sdk-go-v2/aws"
+ 	"github.com/aws/aws-sdk-go-v2/aws/arn"
+ 	"github.com/aws/aws-sdk-go-v2/aws/retry"
+@@ -125,7 +126,8 @@ func New(c Config) (*Store, error) {
+ 	// transport, but never redirect a signed archive request to another origin.
+ 	configuredClient := cfg.HTTPClient.(*awshttp.BuildableClient)
+ 	cfg.HTTPClient = &http.Client{
+-		Transport: configuredClient.GetTransport(), Timeout: configuredClient.GetTimeout(),
++		// allowlist.Guard: the archive endpoint must be on the operator's control-plane allowlist.
++		Transport: allowlist.Guard(configuredClient.GetTransport()), Timeout: configuredClient.GetTimeout(),
+ 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+ 	}
+ 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+diff --git a/cmd/artex/main.go b/cmd/artex/main.go
+index c35a3f9..5e72400 100644
+--- a/cmd/artex/main.go
++++ b/cmd/artex/main.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/Autumn-27/artex/agent"
+ 	"github.com/Autumn-27/artex/config"
+ 	"github.com/Autumn-27/artex/egress"
++	"github.com/Autumn-27/artex/hardening/allowlist"
+ 	"github.com/Autumn-27/artex/server"
+ )
+ 
+@@ -213,6 +214,9 @@ func run() int {
+ 
+ 	go func() {
+ 		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
++		// State the control-plane egress allowlist at startup, so the operator sees
++		// whether it is off, auditing or enforcing, and for which hosts.
++		log.Printf("[egress] control-plane allowlist: %s", allowlist.ActiveAllowlist())
+ 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+ 			log.Fatalf("serve: %v", err)
+ 		}
+diff --git a/mcphttp/client.go b/mcphttp/client.go
+index f5893a3..5c5213b 100644
+--- a/mcphttp/client.go
++++ b/mcphttp/client.go
+@@ -24,6 +24,8 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/Autumn-27/artex/hardening/allowlist"
++
+ 	"github.com/Autumn-27/norma/llm"
+ 	"github.com/Autumn-27/norma/permission"
+ 	actool "github.com/Autumn-27/norma/tool"
+@@ -186,6 +188,7 @@ func New(ctx context.Context, server, url string, headers map[string]string, ins
+ 	if insecure {
+ 		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+ 	}
++	hc.Transport = allowlist.Guard(hc.Transport) // control-plane allowlist; nil keeps the default transport
+ 	c := &Client{
+ 		server:   server,
+ 		url:      url,
+@@ -215,6 +218,7 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
+ 	if insecure {
+ 		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+ 	}
++	hc.Transport = allowlist.Guard(hc.Transport) // control-plane allowlist; nil keeps the default transport
+ 	streamCtx, cancel := context.WithCancel(context.Background())
+ 	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, sseURL, nil)
+ 	if err != nil {
+diff --git a/mcphttp/egress_allowlist_test.go b/mcphttp/egress_allowlist_test.go
+new file mode 100644
+index 0000000..7654bb3
+--- /dev/null
++++ b/mcphttp/egress_allowlist_test.go
+@@ -0,0 +1,44 @@
++package mcphttp
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/Autumn-27/artex/hardening/allowlist"
++)
++
++// An MCP server that is not on the control-plane allowlist must not be contacted,
++// on either transport.
++func TestAllowlistGuardsMCPClients(t *testing.T) {
++	var hits atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		hits.Add(1)
++		w.WriteHeader(http.StatusInternalServerError)
++	}))
++	defer srv.Close()
++
++	prev := allowlist.SetActiveAllowlist(allowlist.ParseAllowlist("enforce", "mcp.example.com"))
++	defer allowlist.SetActiveAllowlist(prev)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	if _, err := New(ctx, "t", srv.URL, nil, false, 5); err == nil || !strings.Contains(err.Error(), "not in the allowlist") {
++		t.Errorf("streamable HTTP to an unlisted host: err=%v, want an allowlist refusal", err)
++	}
++	if _, err := NewSSE(ctx, "t", srv.URL+"/sse", nil, false); err == nil || !strings.Contains(err.Error(), "not in the allowlist") {
++		t.Errorf("SSE to an unlisted host: err=%v, want an allowlist refusal", err)
++	}
++	// The insecure-TLS branch builds its own transport; it must be guarded too.
++	if _, err := New(ctx, "t", srv.URL, nil, true, 5); err == nil || !strings.Contains(err.Error(), "not in the allowlist") {
++		t.Errorf("insecure streamable HTTP to an unlisted host: err=%v, want an allowlist refusal", err)
++	}
++	if hits.Load() != 0 {
++		t.Fatalf("the MCP server was contacted %d time(s) despite the allowlist", hits.Load())
++	}
++}
+diff --git a/notify/egress_allowlist_test.go b/notify/egress_allowlist_test.go
+new file mode 100644
+index 0000000..baf7f11
+--- /dev/null
++++ b/notify/egress_allowlist_test.go
+@@ -0,0 +1,79 @@
++package notify
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/Autumn-27/artex/hardening/allowlist"
++)
++
++// The shared delivery client must refuse a receiver that is not on the
++// control-plane allowlist, before any connection is opened.
++func TestAllowlistGuardsHTTPDelivery(t *testing.T) {
++	t.Setenv(AllowLocalTargetsEnv, "1") // the fake receiver is on loopback
++	var hits atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		hits.Add(1)
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	defer srv.Close()
++
++	prev := allowlist.SetActiveAllowlist(allowlist.ParseAllowlist("enforce", "hooks.example.com"))
++	defer allowlist.SetActiveAllowlist(prev)
++
++	req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader("{}"))
++	if _, err := httpClient.Do(req); err == nil || !strings.Contains(err.Error(), "not in the allowlist") {
++		t.Fatalf("delivery to an unlisted host: err=%v, want an allowlist refusal", err)
++	}
++	if hits.Load() != 0 {
++		t.Fatal("the receiver was contacted despite the allowlist")
++	}
++
++	allowlist.SetActiveAllowlist(allowlist.ParseAllowlist("enforce", "127.0.0.1"))
++	req, _ = http.NewRequest(http.MethodPost, srv.URL, strings.NewReader("{}"))
++	resp, err := httpClient.Do(req)
++	if err != nil {
++		t.Fatalf("delivery to a listed host: %v", err)
++	}
++	resp.Body.Close()
++	if hits.Load() != 1 {
++		t.Fatalf("receiver hits = %d, want 1", hits.Load())
++	}
++}
++
++// SMTP is not an HTTP round trip: the allowlist is checked before the dial.
++func TestAllowlistGuardsSMTPDial(t *testing.T) {
++	t.Setenv(AllowLocalTargetsEnv, "1")
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	var accepted atomic.Int32
++	go func() {
++		for {
++			c, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			accepted.Add(1)
++			c.Close()
++		}
++	}()
++
++	prev := allowlist.SetActiveAllowlist(allowlist.ParseAllowlist("enforce", "smtp.example.com"))
++	defer allowlist.SetActiveAllowlist(prev)
++
++	_, err = emailDial(context.Background(), ln.Addr().String(), "mail.unlisted.example", false)
++	if err == nil || !strings.Contains(err.Error(), "not in the allowlist") {
++		t.Fatalf("SMTP to an unlisted host: err=%v, want an allowlist refusal", err)
++	}
++	if accepted.Load() != 0 {
++		t.Fatal("the SMTP server was dialled despite the allowlist")
++	}
++}
+diff --git a/notify/email.go b/notify/email.go
+index 57be69f..f6a192e 100644
+--- a/notify/email.go
++++ b/notify/email.go
+@@ -12,6 +12,8 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"time"
++
++	"github.com/Autumn-27/artex/hardening/allowlist"
+ )
+ 
+ // emailDialTimeout / emailSessionTimeout bound connection setup and the whole
+@@ -151,6 +153,10 @@ func (c emailChannel) Send(ctx context.Context, cfg map[string]any, m Message) (
+ // can also be used to probe ports. The dial phase is the final enforcement
+ // point and also covers DNS rebinding.
+ func emailDial(ctx context.Context, addr, host string, implicitTLS bool) (*smtp.Client, error) {
++	// SMTP is not an HTTP round trip, so the control-plane allowlist is checked here.
++	if err := allowlist.CheckHost("SMTP delivery", host); err != nil {
++		return nil, err
++	}
+ 	d := &net.Dialer{Timeout: emailDialTimeout, Control: blockInternalDial}
+ 	var conn net.Conn
+ 	var err error
+diff --git a/notify/http.go b/notify/http.go
+index 386ac93..4a752ca 100644
+--- a/notify/http.go
++++ b/notify/http.go
+@@ -14,6 +14,8 @@ import (
+ 	"strings"
+ 	"syscall"
+ 	"time"
++
++	"github.com/Autumn-27/artex/hardening/allowlist"
+ )
+ 
+ // allowLocalTargets decides whether delivering messages to loopback / link-local
+@@ -124,7 +126,7 @@ var notifyTransport = func() *http.Transport {
+ // (such as adding a trailing slash) are still allowed.
+ var httpClient = &http.Client{
+ 	Timeout:   15 * time.Second,
+-	Transport: notifyTransport,
++	Transport: allowlist.Guard(notifyTransport), // control-plane allowlist on top of the dial guard
+ 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+ 		if len(via) >= 5 {
+ 			return errors.New("too many redirects")
+diff --git a/server/manager.go b/server/manager.go
+index bd68b8d..9b4ffd3 100644
+--- a/server/manager.go
++++ b/server/manager.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/Autumn-27/artex/egress"
+ 	"github.com/Autumn-27/artex/enrich"
+ 	"github.com/Autumn-27/artex/guard"
++	"github.com/Autumn-27/artex/hardening/allowlist"
+ 	"github.com/Autumn-27/artex/intercept"
+ 	"github.com/Autumn-27/artex/traffic"
+ 	"github.com/Autumn-27/artex/traffic/rewrite"
+@@ -659,9 +660,29 @@ func (m *Manager) WebSearchOpts() agent.WebSearchOpts {
+ 	if backend == deepSeekWebSearchBackend {
+ 		o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel = m.deepSeekSearchCreds()
+ 	}
++	// The search tool owns its HTTP client (it is built inside the agent
++	// library), so the control-plane allowlist is applied here: a backend whose
++	// endpoint is not approved is not handed to the agents at all.
++	if o.Enabled {
++		if err := searchEgressCheck(backend, o.DeepSeekBaseURL); err != nil {
++			log.Printf("[websearch] disabled: %v", err)
++			o.Enabled = false
++		}
++	}
+ 	return o
+ }
+ 
++// searchEgressCheck applies the control-plane egress allowlist to the endpoint
++// of a search backend. deepSeekBaseURL is the endpoint of the "deepseek"
++// backend, which borrows the active LLM profile.
++func searchEgressCheck(backend, deepSeekBaseURL string) error {
++	endpoint := searchBackendEndpoints[backend]
++	if backend == deepSeekWebSearchBackend {
++		endpoint = deepSeekBaseURL
++	}
++	return allowlist.CheckURL("web search backend "+backend, endpoint)
++}
++
+ // deepSeekSearchCreds resolves the credentials the "deepseek" search backend
+ // borrows from the active LLM profile (it has no key of its own). Whether that
+ // profile can actually drive server-side search — DeepSeek exposes it only on
+diff --git a/server/search_egress_test.go b/server/search_egress_test.go
+new file mode 100644
+index 0000000..0c5594e
+--- /dev/null
++++ b/server/search_egress_test.go
+@@ -0,0 +1,40 @@
++package server
++
++import (
++	"testing"
++
++	"github.com/Autumn-27/artex/hardening/allowlist"
++)
++
++// The search tool owns its HTTP client, so the control-plane allowlist is
++// applied to the backend's endpoint before the tool is handed to an agent.
++func TestSearchEgressCheck(t *testing.T) {
++	prev := allowlist.SetActiveAllowlist(allowlist.ParseAllowlist("off", ""))
++	defer allowlist.SetActiveAllowlist(prev)
++
++	for backend := range searchBackendEndpoints {
++		if err := searchEgressCheck(backend, ""); err != nil {
++			t.Errorf("off: backend %q refused: %v", backend, err)
++		}
++	}
++
++	allowlist.SetActiveAllowlist(allowlist.ParseAllowlist("enforce", "api.tavily.com api.deepseek.com"))
++	cases := []struct {
++		backend, deepSeekBase string
++		ok                    bool
++	}{
++		{"tavily", "", true},
++		{"brave-free", "", false},
++		{"ddgs", "", false},
++		{"keenable", "", false},
++		{deepSeekWebSearchBackend, "https://api.deepseek.com/anthropic", true},
++		{deepSeekWebSearchBackend, "https://other.example/v1", false},
++		{deepSeekWebSearchBackend, "", false}, // no active profile: nothing to approve
++		{"unknown-backend", "", false},        // no known endpoint: refused while enforcing
++	}
++	for _, c := range cases {
++		if err := searchEgressCheck(c.backend, c.deepSeekBase); (err == nil) != c.ok {
++			t.Errorf("searchEgressCheck(%q, %q) err=%v, want allowed=%v", c.backend, c.deepSeekBase, err, c.ok)
++		}
++	}
++}
+diff --git a/server/server.go b/server/server.go
+index 241ad17..6719f3c 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -4214,6 +4214,10 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
+ 		// The search term is decided by the model on DeepSeek's side; "test" is too vague and would make it skip the search and answer directly.
+ 		probeQuery = "DeepSeek company official website"
+ 	}
++	if err := searchEgressCheck(strings.TrimSpace(backend), cfg.DeepSeekBaseURL); err != nil {
++		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "backend": backend})
++		return
++	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), wall)
+ 	defer cancel()
+ 	results, err := actool.WebSearchProbe(ctx, cfg, probeQuery, 3)
+diff --git a/server/server_mgmt.go b/server/server_mgmt.go
+index 732f99a..7537e0b 100644
+--- a/server/server_mgmt.go
++++ b/server/server_mgmt.go
+@@ -31,6 +31,7 @@ import (
+ 
+ 	"github.com/Autumn-27/artex/agent"
+ 	"github.com/Autumn-27/artex/db"
++	"github.com/Autumn-27/artex/hardening/allowlist"
+ 	"github.com/Autumn-27/artex/intercept"
+ 	"github.com/Autumn-27/artex/notify"
+ 	"github.com/Autumn-27/norma/llm"
+@@ -2749,7 +2750,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
+ 	defer transport.CloseIdleConnections()
+ 
+ 	client := &http.Client{
+-		Transport: transport,
++		Transport: allowlist.Guard(transport), // control-plane allowlist on top of the dial guard
+ 		Timeout:   30 * time.Second,
+ 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+ 			if len(via) >= maxModelRedirects {
+diff --git a/server/update_check.go b/server/update_check.go
+index 4d2a7f6..c930040 100644
+--- a/server/update_check.go
++++ b/server/update_check.go
+@@ -10,6 +10,8 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"time"
++
++	"github.com/Autumn-27/artex/hardening/allowlist"
+ )
+ 
+ // The update check is opt-in: only ARTEX_UPDATE_CHECK=1 (or true/on/yes) lets
+@@ -68,7 +70,7 @@ func fetchLatestRelease(ctx context.Context) (string, error) {
+ 	}
+ 	req.Header.Set("User-Agent", "artex-update-check")
+ 	req.Header.Set("Accept", "application/vnd.github+json")
+-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
++	resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: allowlist.Guard(nil)}).Do(req)
+ 	if err != nil {
+ 		return "", err
+ 	}
+diff --git a/server/update_check_egress_test.go b/server/update_check_egress_test.go
+new file mode 100644
+index 0000000..d2c5b4c
+--- /dev/null
++++ b/server/update_check_egress_test.go
+@@ -0,0 +1,21 @@
++package server
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/Autumn-27/artex/hardening/allowlist"
++)
++
++// The update check must not reach GitHub when api.github.com is not on the
++// control-plane allowlist. The refusal comes before any connection, so this
++// needs no network.
++func TestAllowlistGuardsUpdateCheck(t *testing.T) {
++	prev := allowlist.SetActiveAllowlist(allowlist.ParseAllowlist("enforce", "api.anthropic.com"))
++	defer allowlist.SetActiveAllowlist(prev)
++
++	if _, err := fetchLatestRelease(context.Background()); err == nil || !strings.Contains(err.Error(), "not in the allowlist") {
++		t.Fatalf("update check with api.github.com unlisted: err=%v, want an allowlist refusal", err)
++	}
++}

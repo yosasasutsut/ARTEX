@@ -1,0 +1,94 @@
+# Isolated test sandbox for ARTEX (added by hardening pass; not upstream).
+# Runs go build/vet/test inside containers on an INTERNAL docker network, so
+# nothing touches the host network stack, host ports, or the host Go toolchain.
+#
+# Two networks:
+#   netbuild  - has internet, used ONLY to pre-populate the module cache volume.
+#   nettest   - internal:true (no internet), used by the test run + postgres.
+#
+# The repo is mounted READ-ONLY; build/test output goes to named volumes only.
+# By default the tests run on the tree WITH hardening/patches applied (the code
+# the hardened image is built from). APPLY_PATCHES=0 tests the plain upstream tree.
+# Usage: hardening/sandbox/run.sh  (see that script).
+
+services:
+  # One-shot: download Go modules into the gocache volume (needs internet).
+  modcache:
+    image: golang:1.26-bookworm
+    working_dir: /src
+    environment:
+      GOFLAGS: -mod=readonly
+      GOMODCACHE: /gocache/mod
+      GOCACHE: /gocache/build
+    volumes:
+      - ../..:/src:ro
+      - gocache:/gocache
+    networks: [netbuild]
+    # committed go.sum is complete, so readonly download needs no go.sum write.
+    command: ["bash", "-c", "go mod download"]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: artex
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: artextest
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U artex -d artextest"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    networks: [nettest]
+    # No ports: mapping -> not reachable from the host. Only nettest sees it.
+    tmpfs:
+      - /var/lib/postgresql/data   # ephemeral; wiped on container removal
+
+  # The test runner: internal network only, so a test cannot reach the internet
+  # or the host. Postgres is reachable by service name over nettest.
+  tests:
+    image: golang:1.26-bookworm
+    working_dir: /src
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ARTEX_PG_DSN: postgres://artex:testpass@postgres:5432/artextest?sslmode=disable
+      GOMODCACHE: /gocache/mod
+      GOCACHE: /gocache/build
+      GOFLAGS: -mod=readonly
+      PKG: ${PKG:-./...}
+      GOTESTFLAGS: ${GOTESTFLAGS:--p 1}
+      APPLY_PATCHES: ${APPLY_PATCHES:-1}
+    volumes:
+      - ../..:/src:ro
+      - gocache:/gocache
+      - gowork:/work
+    networks: [nettest]
+    # Copy the read-only source into a writable work dir inside the container so
+    # the toolchain can write its temp files without touching the host checkout.
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p /work/src
+        # Copy the source into a writable dir. Exclude web/ (not needed for Go
+        # tests, large) and scripts/poc/ (exploit-shaped files that error on the
+        # Windows bind mount). tar keeps the copy robust and fast.
+        ( cd /src && tar cf - --exclude=./web --exclude=./scripts/poc --exclude=./.git . ) | ( cd /work/src && tar xf - )
+        cd /work/src
+        if [ "$$APPLY_PATCHES" = "1" ]; then
+          for p in hardening/patches/*.patch; do echo "== apply $$p =="; git apply "$$p"; done
+        fi
+        echo "== go build =="; go build ./...
+        echo "== go vet ==";   go vet ./...
+        echo "== go test =="; go test $GOTESTFLAGS $PKG
+
+networks:
+  netbuild: {}
+  nettest:
+    internal: true   # no gateway -> no internet, no host access
+
+volumes:
+  gocache: {}
+  gowork: {}

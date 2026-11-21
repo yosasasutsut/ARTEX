@@ -1,0 +1,4 @@
+# Everything in this folder is copied into Linux images or applied as a patch:
+# keep LF endings on every platform. Patches must never be rewritten at all.
+* text=auto eol=lf
+*.patch -text

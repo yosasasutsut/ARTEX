@@ -1,0 +1,86 @@
+# Hardened deployment overlay (hardening pass; not upstream).
+#
+#   hardening/build.sh        # build artex:local with the patches applied
+#   docker compose -f docker-compose.yml -f hardening/docker-compose.hardened.yml up -d --no-build
+#
+# This file changes nothing in docker-compose.yml: it is layered on top of it.
+# Paths below are relative to the repository root (the directory of the first -f).
+#
+# Adds a network-level egress firewall around the artex container. The egress-fw
+# sidecar owns the network namespace and holds the only NET_ADMIN capability;
+# artex joins that namespace, so the server, agent shells and every bundled tool
+# (curl, nmap, sqlmap ...) can reach only:
+#   - postgres                                               (server process only)
+#   - ARTEX_FW_ALLOW_HOSTS  control-plane hosts, TCP 80/443  (server process only;
+#                           default: ARTEX_EGRESS_ALLOW)
+#   - ARTEX_FW_TARGETS      pentest targets: IPs, CIDRs or host names (any process)
+# Everything else is rejected. DNS answers only for those names (plus
+# ARTEX_FW_DNS_ALLOW); set ARTEX_FW_DNS=open to switch the DNS filter off.
+# With ARTEX_FW_TARGETS empty the scanner can reach
+# no target at all: list the systems you are authorised to test.
+#
+# The in-program allowlist (ARTEX_EGRESS_MODE / ARTEX_EGRESS_ALLOW) still applies
+# on top; this overlay is the layer that also binds shell commands.
+#
+# Note: if egress-fw is recreated, restart artex too (it shares the namespace).
+
+services:
+  egress-fw:
+    build:
+      context: ./hardening/egress-fw
+    image: artex-egress-fw:local
+    cap_drop: [ALL]
+    # NET_ADMIN/NET_RAW: install the rules. SETUID/SETGID: let dnsmasq drop to its own user.
+    cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID]
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      FW_ALLOW_HOSTS: ${ARTEX_FW_ALLOW_HOSTS:-${ARTEX_EGRESS_ALLOW:-}}
+      FW_TARGETS: ${ARTEX_FW_TARGETS:-}
+      FW_INTERNAL_HOSTS: postgres
+      FW_REFRESH: ${ARTEX_FW_REFRESH:-60}
+      FW_DNS: ${ARTEX_FW_DNS:-filter}
+      FW_DNS_ALLOW: ${ARTEX_FW_DNS_ALLOW:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # The published ports move here: they belong to the namespace owner.
+    ports:
+      - "${ARTEX_BIND_ADDR:-127.0.0.1}:8787:8787"
+      - "127.0.0.1:8788:8788"
+    restart: unless-stopped
+
+  # Postgres pinned by digest; refresh with `docker buildx imagetools inspect postgres:16-alpine`.
+  postgres:
+    image: postgres:16-alpine@sha256:1d5b02d3a9941fbd52437db4107f8c52d6297dac553ca1e5c299ebb3756b4857
+
+  artex:
+    network_mode: "service:egress-fw"
+    # In-program allowlist settings (read by an image built with hardening/build.sh;
+    # an unpatched image ignores them and relies on the firewall alone).
+    environment:
+      ARTEX_EGRESS_MODE: ${ARTEX_EGRESS_MODE:-}
+      ARTEX_EGRESS_ALLOW: ${ARTEX_EGRESS_ALLOW:-}
+    ports: !reset []
+    depends_on:
+      postgres:
+        condition: service_healthy
+      egress-fw:
+        condition: service_healthy
+    # Named volumes instead of the ./keys, ./data and ./skills bind mounts. On a
+    # Windows or macOS host a bind mount shows every directory as mode 0777, which
+    # removes the 0700 protection of the key directory and of the server-only files
+    # under data/ (capture CA, sessions): the agent identity could then delete or
+    # replace the JWT and secret keys, and rewrite the skill files that steer later
+    # runs. A named volume keeps the real Linux permissions. The skills volume is
+    # filled from the image on first start; edit skills in the UI.
+    # Back up with: docker run --rm -v artex_artex-keys:/k -v "$PWD":/b alpine tar czf /b/keys.tgz -C /k .
+    volumes:
+      - artex-keys:/app/keys
+      - artex-data:/app/data
+      - artex-skills:/app/skills
+
+volumes:
+  artex-keys: {}
+  artex-data: {}
+  artex-skills: {}

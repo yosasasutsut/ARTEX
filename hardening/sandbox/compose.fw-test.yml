@@ -1,0 +1,4 @@
+# Test-only overlay: the hardened stack with NO port published to the host.
+services:
+  egress-fw:
+    ports: !reset []
